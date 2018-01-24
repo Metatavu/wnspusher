@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from pony import orm
 from datetime import datetime
 import threading
@@ -6,6 +6,7 @@ import requests
 import toml
 import os
 import time
+import logging
 
 class ConfigurationException(Exception):
     pass
@@ -16,6 +17,10 @@ if not 'WNS_PUSHER_CONFIG' in os.environ:
 _config = toml.load(os.environ['WNS_PUSHER_CONFIG'])
 
 _db = orm.Database()
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 
 class Subscriber(_db.Entity):
     id = orm.PrimaryKey(int, auto=True)
@@ -78,6 +83,7 @@ def _do_post_request(url, data, headers=None):
 def _ensure_access_token():
     for app in ClientApplication.select():
         if not WnsAccessToken.exists(app=app):
+            logger.info("no access token for %s, fetching new...", app.app_name)
             data = {
                 "grant_type": "client_credentials",
                 "client_id": app.client_id,
@@ -86,14 +92,20 @@ def _ensure_access_token():
             }
             result = _do_post_request(_config["token_url"], data=data)
             result_json = result.json()
+            logger.info("got access token: %s", result.text)
             WnsAccessToken(app=app,
-                           content=result_json.access_token,
+                           content=result_json["access_token"],
                            issued=datetime.utcnow())
 
 
 @orm.db_session
-def add_subscription(channel_url):
-    Subscriber(channel_url=channel_url, subscribed=datetime.utcnow())
+def add_subscription(app_name, channel_url):
+    app = ClientApplication.get(app_name=app_name)
+    if app is None:
+        raise NoSuchAppException("No app named {}".format(app_name))
+    return Subscriber(app=app,
+                      channel_url=channel_url,
+                      subscribed=datetime.utcnow())
     
 
 @orm.db_session
@@ -106,8 +118,14 @@ def broadcast_notification(app_name, content, launch_args, content_type, wns_typ
                       launch_args=launch_args,
                       content_type=content_type,
                       wns_type=wns_type)
+    num_pending = 0
     for sub in orm.select(s for s in Subscriber if s.app == app):
-        PendingNotification(subscriber=sub, message=message)
+        PendingNotification(subscriber=sub,
+                            message=message,
+                            issued=datetime.utcnow())
+        num_pending += 1
+        
+    return {"num_pending": num_pending}
 
 
 def process_notification():
@@ -119,6 +137,7 @@ def process_notification():
                             .order_by(lambda p: p.issued)
                             .first())
         if next_pending is not None:
+            logger.info("processing pending notification %s...", next_pending)
             message = next_pending.message
             subscriber = next_pending.subscriber
             app = message.app
@@ -132,7 +151,9 @@ def process_notification():
                 'Authorization': 'Bearer {}'.format(token.content),
             }
             data = message.content
-            _do_post_request(subscriber.channel_url, data=data, headers=headers)
+            result = _do_post_request(subscriber.channel_url, data=data, headers=headers)
+            logger.info("got response for posting notification: %s",
+                        (result.status_code, result.text, result.headers))
             next_pending.delete()
 
 
@@ -148,17 +169,25 @@ app = Flask(__name__)
 @app.route("/subscribers", methods=['POST'])
 def add_subscriber_endpoint():
     body = request.get_json()
-    add_subscription(body.channel_url)
+    new_sub = add_subscription(body["app"], body["channelUrl"])
+    return jsonify({
+        "app": new_sub.app,
+        "channelUrl": new_sub.channel_url
+    })
 
 
 @app.route("/notifications", methods=['POST'])
 def broadcast_notification_endpoint():
     body = request.get_json()
-    broadcast_notification(app_name=body.app_name,
-                           content=body.content,
-                           launch_args=body.launchArgs,
-                           content_type=body.contentType,
-                           wns_type=body.wnsType)
+    logger.info("Sending notification %s to %s", body["content"], body["appName"])
+    info = broadcast_notification(app_name=body["appName"],
+                                  content=body["content"],
+                                  launch_args=body["launchArgs"],
+                                  content_type=body["contentType"],
+                                  wns_type=body["wnsType"])
+    return jsonify({
+        "num_pending": info["num_pending"]
+    })
 
 
 @app.before_first_request
