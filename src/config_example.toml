@@ -1,0 +1,10 @@
+token_scope="notify.windows.com"
+token_url="https://login.live.com/accesstoken.srf"
+
+process_interval=0.01
+
+db_provider="sqlite"
+db_filename="wnspusher.sqlite"
+db_create=true
+db_startup="make_tables"
+db_debug=true
