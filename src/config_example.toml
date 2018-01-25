@@ -1,3 +1,5 @@
+logging_level = "DEBUG"
+
 token_scope="notify.windows.com"
 token_url="https://login.live.com/accesstoken.srf"
 

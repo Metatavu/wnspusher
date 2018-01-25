@@ -1,14 +1,32 @@
+#     Push broker for Windows Notification Services
+#     Copyright (C) 2018 Metatavu Oy
+#
+#     This program is free software: you can redistribute it and/or modify
+#     it under the terms of the GNU Affero General Public License as
+#     published by the Free Software Foundation, either version 3 of the
+#     License, or (at your option) any later version.
+#
+#     This program is distributed in the hope that it will be useful,
+#     but WITHOUT ANY WARRANTY; without even the implied warranty of
+#     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#     GNU Affero General Public License for more details.
+#
+#     You should have received a copy of the GNU Affero General Public License
+#     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import BadRequest
 from pony import orm
 from datetime import datetime
-from enum import IntEnum
-import threading
 import requests
 import toml
 import os
 import time
 import logging
 import yoyo
+import sys
+import urllib.parse
+import signal
 
 
 PERMISSION_LEVEL_SUBSCRIBE = 1
@@ -27,20 +45,26 @@ class ForbiddenException(Exception):
     pass
 
 
-if 'WNS_PUSHER_CONFIG' not in os.environ:
-    raise ConfigurationException(
-        "Environment variable WNS_PUSHER_CONFIG not set")
+class NoSuchAppException(Exception):
+    pass
 
 
-_config = toml.load(os.environ['WNS_PUSHER_CONFIG'])
+if 'WNS_PUSHER_CONFIG' in os.environ:
+    _config = toml.load(os.environ['WNS_PUSHER_CONFIG'])
+elif len(sys.argv) >= 2:
+    _config = toml.load(sys.argv[1])
+else:
+    raise ConfigurationException("Configuration file location not set." +
+                                 "Pass it as argv[1] or WNS_PUSHER_CONFIG" +
+                                 "environment variable.")
 
 
 _db = orm.Database()
 
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-logging.basicConfig(level=logging.DEBUG)
+_logger = logging.getLogger(__name__)
+_logger.setLevel(getattr(logging, _config['logging_level']))
+logging.basicConfig(level=getattr(logging, _config['logging_level']))
 
 
 class Subscriber(_db.Entity):
@@ -55,7 +79,6 @@ class Message(_db.Entity):
     id = orm.PrimaryKey(int, auto=True)
     app = orm.Required(lambda: ClientApplication)
     content = orm.Required(str)
-    launch_args = orm.Required(str)
     content_type = orm.Required(str)
     wns_type = orm.Required(str)
     pending = orm.Set(lambda: PendingNotification)
@@ -65,7 +88,7 @@ class PendingNotification(_db.Entity):
     id = orm.PrimaryKey(int, auto=True)
     subscriber = orm.Required(lambda: Subscriber)
     message = orm.Required(lambda: Message)
-    issued = orm.Required(datetime)
+    issued = orm.Required(datetime, index=True)
 
 
 class ClientApplication(_db.Entity):
@@ -94,38 +117,37 @@ class ApiKey(_db.Entity):
     key = orm.Required(str, unique=True)
 
 
-class NoSuchAppException(Exception):
-    pass
-
-
 def _do_post_request(url, data, headers=None):
     return requests.post(url, data=data, headers=headers)
 
 
-def _ensure_access_token():
-    for app in ClientApplication.select():
-        if not WnsAccessToken.exists(app=app):
-            logger.info("no access token for %s, fetching new...",
-                        app.app_name)
-            data = {
-                "grant_type": "client_credentials",
-                "client_id": app.client_id,
-                "client_secret": app.client_secret,
-                "scope": _config["token_scope"],
-            }
-            result = _do_post_request(_config["token_url"], data=data)
-            result_json = result.json()
-            logger.info("got access token: %s", result.text)
-            WnsAccessToken(app=app,
-                           content=result_json["access_token"],
-                           issued=datetime.utcnow())
+def _refresh_access_token(app):
+    orm.delete(t for t in WnsAccessToken if t.app == app)
+    _logger.info("invalid/missing access token for %s, fetching new",
+                 app.app_name)
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": app.client_id,
+        "client_secret": app.client_secret,
+        "scope": _config["token_scope"],
+    }
+    result = _do_post_request(_config["token_url"], data=data)
+    result_json = result.json()
+    _logger.debug("got access token: %s", result.text)
+    if result.status_code == 200:
+        WnsAccessToken(app=app,
+                       content=result_json["access_token"],
+                       issued=datetime.utcnow())
 
 
 @orm.db_session
-def add_subscription(app_name, channel_url):
+def add_subscriber(app_name, channel_url):
     app = ClientApplication.get(app_name=app_name)
     if app is None:
         raise NoSuchAppException("No app named {}".format(app_name))
+    channel_url_parsed = urllib.parse.urlparse(channel_url)
+    if channel_url_parsed.netloc != 'notify.windows.com':
+        raise ValueError("Channel url doesn't point to notify.windows.com")
     return Subscriber(app=app,
                       channel_url=channel_url,
                       subscribed=datetime.utcnow())
@@ -134,7 +156,6 @@ def add_subscription(app_name, channel_url):
 @orm.db_session
 def broadcast_notification(app_name,
                            content,
-                           launch_args,
                            content_type,
                            wns_type):
     app = ClientApplication.get(app_name=app_name)
@@ -142,7 +163,6 @@ def broadcast_notification(app_name,
         raise NoSuchAppException("No app named {}".format(app_name))
     message = Message(app=app,
                       content=content,
-                      launch_args=launch_args,
                       content_type=content_type,
                       wns_type=wns_type)
     num_pending = 0
@@ -155,30 +175,31 @@ def broadcast_notification(app_name,
 
 
 @orm.db_session
-def key_permission_level(auth_header):
+def key_permission_level(auth_header, app_name):
     parts = auth_header.split(" ")
     if len(parts) != 2:
-        raise ValueError("Incorrect auth_header")
+        raise ValueError("Incorrect auth header")
     (auth_type, key) = parts
     if auth_type != "APIKEY":
         raise ValueError("Incorrect auth type")
     api_key_object = ApiKey.get(key=key)
+    app = ClientApplication.get(app_name=app_name)
     if api_key_object is None:
-        return None
+        raise UnauthorizedException("API key doesn't exist")
+    if api_key_object.app.id != app.id:
+        raise UnauthorizedException("API key associated with wrong app")
     else:
         return api_key_object.permission_level
 
 
 def process_notification():
     with orm.db_session:
-        _ensure_access_token()
-    with orm.db_session:
         next_pending = (PendingNotification
                         .select()
                         .order_by(lambda p: p.issued)
                         .first())
         if next_pending is not None:
-            logger.info("processing pending notification %s...", next_pending)
+            _logger.debug("Processing pending notification %s", next_pending)
             message = next_pending.message
             subscriber = next_pending.subscriber
             app = message.app
@@ -186,6 +207,9 @@ def process_notification():
                      .select(lambda t: t.app == app)
                      .order_by(orm.desc(lambda t: t.issued))
                      .first())
+            if token is None:
+                _refresh_access_token(app)
+                return False
             headers = {
                 'Content-Type': message.content_type,
                 'X-WNS-Type': message.wns_type,
@@ -195,32 +219,41 @@ def process_notification():
             result = _do_post_request(subscriber.channel_url,
                                       data=data,
                                       headers=headers)
-            logger.info("got response for posting notification: %s",
-                        (result.status_code, result.text, result.headers))
-            next_pending.delete()
-
-
-def worker_func():
-    while True:
-        time.sleep(_config["process_interval"])
-        process_notification()
+            _logger.debug("Got response for posting notification: %s",
+                          (result.status_code, result.text, result.headers))
+            if result.status_code == 401:
+                _refresh_access_token(app)
+                return False
+            elif result.status_code == 410:
+                orm.delete(p for p in PendingNotification
+                           if p.subscriber == subscriber)
+                subscriber.delete()
+                return False
+            elif result.status_code == 200:
+                next_pending.delete()
+                return True
+            else:
+                _logger.error(
+                    "Unrecognized result from WNS: %s",
+                    (result.status_code, result.text, result.headers))
+                return False
+        else:
+            return True
 
 
 app = Flask(__name__)
 
 
-def check_permissions(target_level):
+def _check_permissions(target_level):
     if 'Authorization' not in request.headers:
-        raise ValueError("Authentication header not set")
+        raise ValueError("Authorization header not set")
     auth_header = request.headers['Authorization']
     permission_level = key_permission_level(auth_header)
-    if permission_level is None:
-        raise UnauthorizedException("Invalid API key")
     if permission_level < target_level:
         raise UnauthorizedException("API key doesn't have enough permissions")
 
 
-def jsonify_error(error_msg, details):
+def _jsonify_error(error_msg, details):
     return jsonify({
         "error": error_msg,
         "details": str(details)
@@ -229,33 +262,34 @@ def jsonify_error(error_msg, details):
 
 @app.errorhandler(UnauthorizedException)
 def handle_unauthorized(e):
-    return jsonify_error("Unauthorized request", e), 401
+    return _jsonify_error("Unauthorized request", e), 401
 
 
 @app.errorhandler(ForbiddenException)
 def handle_forbidden(e):
-    return jsonify_error("Forbidden request", e), 403
+    return _jsonify_error("Forbidden request", e), 403
 
 
 @app.errorhandler(ValueError)
 @app.errorhandler(KeyError)
+@app.errorhandler(BadRequest)
 def handle_invalid(e):
-    return jsonify_error("Invalid input value", e), 400
+    return _jsonify_error("Invalid input value", e), 400
 
 
 @app.errorhandler(Exception)
 def handle_error(e):
-    return jsonify_error("Internal server error", e), 500
+    return _jsonify_error("Internal server error", e), 500
 
 
 @app.route("/subscribers", methods=['POST'])
 def add_subscriber_endpoint():
-    check_permissions(PERMISSION_LEVEL_SUBSCRIBE)
+    _check_permissions(PERMISSION_LEVEL_SUBSCRIBE)
     body = request.get_json()
-    logger.info("Adding subscriber %s to %s",
-                body["app"],
-                body["channelUrl"])
-    new_sub = add_subscription(body["app"], body["channelUrl"])
+    _logger.info("Adding subscriber %s to %s",
+                 body["app"],
+                 body["channelUrl"])
+    new_sub = add_subscriber(body["app"], body["channelUrl"])
     return jsonify({
         "app": new_sub.app,
         "channelUrl": new_sub.channel_url
@@ -264,19 +298,24 @@ def add_subscriber_endpoint():
 
 @app.route("/notifications", methods=['POST'])
 def broadcast_notification_endpoint():
-    check_permissions(PERMISSION_LEVEL_PUSH)
+    _check_permissions(PERMISSION_LEVEL_PUSH)
     body = request.get_json()
-    logger.info("Sending notification %s to %s",
-                body["content"],
-                body["appName"])
-    info = broadcast_notification(app_name=body["appName"],
+    _logger.info("Sending notification %s to %s",
+                 body["content"],
+                 body["app"])
+    _logger.debug("Received request body: %s", body)
+    info = broadcast_notification(app_name=body["app"],
                                   content=body["content"],
-                                  launch_args=body["launchArgs"],
                                   content_type=body["contentType"],
                                   wns_type=body["wnsType"])
     return jsonify({
         "num_pending": info["num_pending"]
     })
+
+
+@app.route("/ping", methods=['GET', 'POST'])
+def ping_endpoint():
+    return "pong"
 
 
 @app.before_first_request
@@ -315,6 +354,15 @@ def init_app():
     else:
         raise ConfigurationException("Database startup configured improperly")
 
-    worker_thread = threading.Thread(target=worker_func)
-    worker_thread.daemon = True
-    worker_thread.start()
+
+def process_queue():
+    init_app()
+    finished = False
+    if hasattr(signal, 'SIGTERM'):
+        def abort(signum, frame):
+            nonlocal finished
+            finished = True # noqa
+        signal.signal(signal.SIGTERM, abort)
+    while not finished:
+        time.sleep(_config["process_interval"])
+        process_notification()
