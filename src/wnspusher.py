@@ -244,11 +244,11 @@ def process_notification():
 app = Flask(__name__)
 
 
-def _check_permissions(target_level):
+def _check_permissions(target_level, app_name):
     if 'Authorization' not in request.headers:
         raise ValueError("Authorization header not set")
     auth_header = request.headers['Authorization']
-    permission_level = key_permission_level(auth_header)
+    permission_level = key_permission_level(auth_header, app_name)
     if permission_level < target_level:
         raise UnauthorizedException("API key doesn't have enough permissions")
 
@@ -279,13 +279,14 @@ def handle_invalid(e):
 
 @app.errorhandler(Exception)
 def handle_error(e):
+    _logger.error("Internal server error: %s", e)
     return _jsonify_error("Internal server error", e), 500
 
 
 @app.route("/subscribers", methods=['POST'])
 def add_subscriber_endpoint():
-    _check_permissions(PERMISSION_LEVEL_SUBSCRIBE)
     body = request.get_json()
+    _check_permissions(PERMISSION_LEVEL_SUBSCRIBE, body["app"])
     _logger.info("Adding subscriber %s to %s",
                  body["app"],
                  body["channelUrl"])
@@ -298,8 +299,8 @@ def add_subscriber_endpoint():
 
 @app.route("/notifications", methods=['POST'])
 def broadcast_notification_endpoint():
-    _check_permissions(PERMISSION_LEVEL_PUSH)
     body = request.get_json()
+    _check_permissions(PERMISSION_LEVEL_PUSH, body["app"])
     _logger.info("Sending notification %s to %s",
                  body["content"],
                  body["app"])
