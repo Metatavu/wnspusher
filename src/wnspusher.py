@@ -62,9 +62,9 @@ else:
 _db = orm.Database()
 
 
-_logger = logging.getLogger(__name__)
-_logger.setLevel(getattr(logging, _config['logging_level']))
-logging.basicConfig(level=getattr(logging, _config['logging_level']))
+logging.basicConfig(level=getattr(logging, _config['logging_level']),
+                    stream=sys.stderr,
+                    format="%(asctime)s - %(module)s:%(message)s")
 
 
 class Subscriber(_db.Entity):
@@ -123,7 +123,7 @@ def _do_post_request(url, data, headers=None):
 
 def _refresh_access_token(app):
     orm.delete(t for t in WnsAccessToken if t.app == app)
-    _logger.info("invalid/missing access token for %s, fetching new",
+    logging.info("invalid/missing access token for %s, fetching new",
                  app.app_name)
     data = {
         "grant_type": "client_credentials",
@@ -133,7 +133,7 @@ def _refresh_access_token(app):
     }
     result = _do_post_request(_config["token_url"], data=data)
     result_json = result.json()
-    _logger.debug("got access token: %s", result.text)
+    logging.debug("got access token: %s", result.text)
     if result.status_code == 200:
         WnsAccessToken(app=app,
                        content=result_json["access_token"],
@@ -199,7 +199,7 @@ def process_notification():
                         .order_by(lambda p: p.issued)
                         .first())
         if next_pending is not None:
-            _logger.debug("Processing pending notification %s", next_pending)
+            logging.debug("Processing pending notification %s", next_pending)
             message = next_pending.message
             subscriber = next_pending.subscriber
             app = message.app
@@ -219,7 +219,7 @@ def process_notification():
             result = _do_post_request(subscriber.channel_url,
                                       data=data,
                                       headers=headers)
-            _logger.debug("Got response for posting notification: %s",
+            logging.debug("Got response for posting notification: %s",
                           (result.status_code, result.text, result.headers))
             if result.status_code == 401:
                 _refresh_access_token(app)
@@ -232,7 +232,7 @@ def process_notification():
                 return False
             elif result.status_code == 403:
                 # Channel associated with wrong app
-                _logger.info("Channel associated with wrong app: {}"
+                logging.info("Channel associated with wrong app: {}"
                              .format(subscriber.channel_url))
                 orm.delete(p for p in PendingNotification
                            if p.subscriber == subscriber)
@@ -240,7 +240,7 @@ def process_notification():
                 return False
             elif result.status_code == 404:
                 # Invalid channel
-                _logger.info("Invalid channel URL: {}"
+                logging.info("Invalid channel URL: {}"
                              .format(subscriber.channel_url))
                 orm.delete(p for p in PendingNotification
                            if p.subscriber == subscriber)
@@ -250,7 +250,7 @@ def process_notification():
                 next_pending.delete()
                 return True
             else:
-                _logger.error(
+                logging.error(
                     "Unrecognized result from WNS: %s",
                     (result.status_code, result.text, result.headers))
                 return False
@@ -296,7 +296,7 @@ def handle_invalid(e):
 
 @app.errorhandler(Exception)
 def handle_error(e):
-    _logger.error("Internal server error: %s", e)
+    logging.error("Internal server error: %s", e)
     return _jsonify_error("Internal server error", e), 500
 
 
@@ -304,7 +304,7 @@ def handle_error(e):
 def add_subscriber_endpoint():
     body = request.get_json()
     _check_permissions(PERMISSION_LEVEL_SUBSCRIBE, body["app"])
-    _logger.info("Adding subscriber %s to %s",
+    logging.info("Adding subscriber %s to %s",
                  body["app"],
                  body["channelUrl"])
     new_sub = add_subscriber(body["app"], body["channelUrl"])
@@ -318,10 +318,10 @@ def add_subscriber_endpoint():
 def broadcast_notification_endpoint():
     body = request.get_json()
     _check_permissions(PERMISSION_LEVEL_PUSH, body["app"])
-    _logger.info("Sending notification %s to %s",
+    logging.info("Sending notification %s to %s",
                  body["content"],
                  body["app"])
-    _logger.debug("Received request body: %s", body)
+    logging.debug("Received request body: %s", body)
     info = broadcast_notification(app_name=body["app"],
                                   content=body["content"],
                                   content_type=body["contentType"],
