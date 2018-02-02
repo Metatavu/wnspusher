@@ -309,8 +309,8 @@ def add_subscriber_endpoint():
                  body["channelUrl"])
     new_sub = add_subscriber(body["app"], body["channelUrl"])
     return jsonify({
-        "app": new_sub.app,
-        "channelUrl": new_sub.channel_url
+        "app": body["app"],
+        "channelUrl": body["channelUrl"]
     })
 
 
@@ -384,3 +384,8 @@ def process_queue():
     while not finished:
         time.sleep(_config["process_interval"])
         process_notification()
+
+
+if __name__ == "__main__":
+    # run in queue processing mode
+    process_queue()
