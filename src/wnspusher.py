@@ -225,6 +225,23 @@ def process_notification():
                 _refresh_access_token(app)
                 return False
             elif result.status_code == 410:
+                # Channel expired
+                orm.delete(p for p in PendingNotification
+                           if p.subscriber == subscriber)
+                subscriber.delete()
+                return False
+            elif result.status_code == 403:
+                # Channel associated with wrong app
+                _logger.info("Channel associated with wrong app: {}"
+                             .format(subscriber.channel_url))
+                orm.delete(p for p in PendingNotification
+                           if p.subscriber == subscriber)
+                subscriber.delete()
+                return False
+            elif result.status_code == 404:
+                # Invalid channel
+                _logger.info("Invalid channel URL: {}"
+                             .format(subscriber.channel_url))
                 orm.delete(p for p in PendingNotification
                            if p.subscriber == subscriber)
                 subscriber.delete()
