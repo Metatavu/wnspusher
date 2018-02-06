@@ -146,7 +146,7 @@ def add_subscriber(app_name, channel_url):
     if app is None:
         raise NoSuchAppException("No app named {}".format(app_name))
     channel_url_parsed = urllib.parse.urlparse(channel_url)
-    if channel_url_parsed.netloc != _config["channel_url_domain"]:
+    if channel_url_parsed.netloc.endswith(_config["channel_url_domain"]):
         raise ValueError("Channel url doesn't point to " +
                          _config["channel_url_domain"])
     return Subscriber(app=app,
@@ -222,39 +222,39 @@ def process_notification():
                                       headers=headers)
             logging.debug("Got response for posting notification: %s",
                           (result.status_code, result.text, result.headers))
+            is_ok = False
+            purge = False
             if result.status_code == 401:
                 _refresh_access_token(app)
-                return False
             elif result.status_code == 410:
                 # Channel expired
-                orm.delete(p for p in PendingNotification
-                           if p.subscriber == subscriber)
-                subscriber.delete()
-                return False
+                purge = True
             elif result.status_code == 403:
                 # Channel associated with wrong app
                 logging.info("Channel associated with wrong app: {}"
                              .format(subscriber.channel_url))
-                orm.delete(p for p in PendingNotification
-                           if p.subscriber == subscriber)
-                subscriber.delete()
-                return False
+                purge = True
             elif result.status_code == 404:
                 # Invalid channel
                 logging.info("Invalid channel URL: {}"
                              .format(subscriber.channel_url))
-                orm.delete(p for p in PendingNotification
-                           if p.subscriber == subscriber)
-                subscriber.delete()
-                return False
+                purge = True
             elif result.status_code == 200:
                 next_pending.delete()
-                return True
+                is_ok = True
+            elif 500 <= result.status_code < 600:
+                # Error in Microsoft Store, try again later
+                pass
             else:
                 logging.error(
                     "Unrecognized result from WNS: %s",
                     (result.status_code, result.text, result.headers))
-                return False
+                next_pending.delete()
+            if purge:
+                orm.delete(p for p in PendingNotification
+                           if p.subscriber == subscriber)
+                subscriber.delete()
+            return is_ok
         else:
             return True
 
