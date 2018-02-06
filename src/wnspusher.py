@@ -322,7 +322,6 @@ def broadcast_notification_endpoint():
     logging.info("Sending notification %s to %s",
                  body["content"],
                  body["app"])
-    logging.debug("Received request body: %s", body)
     info = broadcast_notification(app_name=body["app"],
                                   content=body["content"],
                                   content_type=body["contentType"],
