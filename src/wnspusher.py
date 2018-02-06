@@ -146,7 +146,7 @@ def add_subscriber(app_name, channel_url):
     if app is None:
         raise NoSuchAppException("No app named {}".format(app_name))
     channel_url_parsed = urllib.parse.urlparse(channel_url)
-    if channel_url_parsed.netloc.endswith(_config["channel_url_domain"]):
+    if !channel_url_parsed.netloc.endswith(_config["channel_url_domain"]):
         raise ValueError("Channel url doesn't point to " +
                          _config["channel_url_domain"])
     return Subscriber(app=app,
