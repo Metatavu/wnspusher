@@ -149,9 +149,13 @@ def add_subscriber(app_name, channel_url):
     if not channel_url_parsed.netloc.endswith(_config["channel_url_domain"]):
         raise ValueError("Channel url doesn't point to " +
                          _config["channel_url_domain"])
-    return Subscriber(app=app,
-                      channel_url=channel_url,
-                      subscribed=datetime.utcnow())
+    # Subject to a benign race condition; worst case is harmless error message
+    subscriber = Subscriber.get(channel_url=channel_url)
+    if subscriber is None:
+        subscriber = Subscriber(app=app,
+                                channel_url=channel_url,
+                                subscribed=datetime.utcnow())
+    return subscriber
 
 
 @orm.db_session
@@ -308,7 +312,7 @@ def add_subscriber_endpoint():
     logging.info("Adding subscriber %s to %s",
                  body["app"],
                  body["channelUrl"])
-    new_sub = add_subscriber(body["app"], body["channelUrl"])
+    add_subscriber(body["app"], body["channelUrl"])
     return jsonify({
         "app": body["app"],
         "channelUrl": body["channelUrl"]
